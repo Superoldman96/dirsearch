@@ -12,12 +12,16 @@ use base64::Engine;
 use bytes::Bytes;
 use digest_auth::{AuthContext, HttpMethod};
 use futures_util::TryStreamExt;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_ENCODING, WWW_AUTHENTICATE};
+use reqwest::header::{
+    HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_ENCODING, USER_AGENT, WWW_AUTHENTICATE,
+};
 use reqwest::Method;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{hash_map::RandomState, HashMap};
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
@@ -25,6 +29,82 @@ use tokio_util::io::StreamReader;
 
 pub(crate) type HeaderPairs = Vec<(String, String)>;
 type AsyncBodyReader = Pin<Box<dyn AsyncRead + Send>>;
+
+/// Immutable User-Agent corpus with one lock-free selection sequence.
+///
+/// The values belong to the engine context. Only the sequence changes, so
+/// workers never mutate the shared header map or contend on a mutex.
+#[derive(Clone)]
+pub(crate) struct RandomUserAgentPool {
+    values: Arc<[RandomUserAgent]>,
+    seed: u64,
+    sequence: Arc<AtomicU64>,
+}
+
+struct RandomUserAgent {
+    raw: String,
+    header: HeaderValue,
+}
+
+impl RandomUserAgentPool {
+    pub(crate) fn from_values(values: Vec<String>) -> Result<Option<Self>, String> {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_usize(values.len());
+        Self::from_values_with_seed(values, hasher.finish())
+    }
+
+    fn from_values_with_seed(values: Vec<String>, seed: u64) -> Result<Option<Self>, String> {
+        if values.is_empty() {
+            return Ok(None);
+        }
+        let values = values
+            .into_iter()
+            .map(|raw| {
+                let header = HeaderValue::try_from(raw.as_str())
+                    .map_err(|error| format!("Invalid random User-Agent value: {error}"))?;
+                Ok(RandomUserAgent { raw, header })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Some(Self {
+            values: values.into(),
+            seed,
+            sequence: Arc::new(AtomicU64::new(0)),
+        }))
+    }
+
+    fn select(&self) -> &RandomUserAgent {
+        // This counter supplies distinct PRNG input; it does not synchronize
+        // data, so relaxed ordering is sufficient across request workers.
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let random = splitmix64(self.seed.wrapping_add(sequence));
+        &self.values[(random as usize) % self.values.len()]
+    }
+
+    pub(crate) fn select_raw(&self) -> &str {
+        &self.select().raw
+    }
+
+    fn select_header(&self) -> &HeaderValue {
+        &self.select().header
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seeded(values: Vec<String>, seed: u64) -> Result<Option<Self>, String> {
+        Self::from_values_with_seed(values, seed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_text(&self) -> &str {
+        self.select_raw()
+    }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
 
 #[derive(Clone)]
 pub(crate) enum OriginAuth {
@@ -181,6 +261,9 @@ pub(crate) struct ClientRequest<'a> {
     pub(crate) filter_config: &'a NativeFilterConfig,
     pub(crate) compact_filtered: bool,
     pub(crate) origin_auth: &'a OriginAuth,
+    /// Selected independently for every network attempt and then kept stable
+    /// across redirects or a Digest challenge within that attempt.
+    pub(crate) random_user_agents: Option<&'a RandomUserAgentPool>,
 }
 
 pub(crate) async fn request_with_client(request: ClientRequest<'_>) -> NativeHttpResult {
@@ -225,7 +308,10 @@ async fn request_once(
     request: &ClientRequest<'_>,
     start: Instant,
 ) -> Result<NativeHttpResult, String> {
-    let send_request = || send_authenticated_request(request);
+    let random_user_agent = request
+        .random_user_agents
+        .map(RandomUserAgentPool::select_header);
+    let send_request = || send_authenticated_request(request, random_user_agent);
     let (response, redirect_history) = if request.capture_redirect_history {
         REDIRECT_HISTORY
             .scope(RefCell::new(Vec::new()), async {
@@ -278,9 +364,13 @@ async fn request_once(
 
 async fn send_authenticated_request(
     request: &ClientRequest<'_>,
+    random_user_agent: Option<&HeaderValue>,
 ) -> Result<reqwest::Response, String> {
     let build_request = |target: &str| {
-        let builder = request.client.request(request.method.clone(), target);
+        let mut builder = request.client.request(request.method.clone(), target);
+        if let Some(user_agent) = random_user_agent {
+            builder = builder.header(USER_AGENT, user_agent.clone());
+        }
         if request.body.is_empty() {
             builder
         } else {

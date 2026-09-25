@@ -7,6 +7,7 @@ use crate::result::{native_completion_marker, native_error_result, NativeHttpRes
 use crate::session::NativeHttpSession;
 use crate::transport::{
     build_http_client, request_with_client, ClientRequest, HeaderPairs, OriginAuth,
+    RandomUserAgentPool,
 };
 use crate::wordlist::NativeWordlistBatch;
 use bytes::Bytes;
@@ -21,6 +22,8 @@ use tokio::task::JoinSet;
 
 const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PROXY_AUTHENTICATION_REQUIRED: u16 = 407;
+const RANDOM_USER_AGENT_CONFLICT_ERROR: &str =
+    "Random User-Agent values cannot be combined with a fixed User-Agent header";
 
 #[pyclass]
 pub(crate) struct NativeHttpEngine {
@@ -50,6 +53,7 @@ struct NativeRequestContext {
     initial_cookie_override: Option<HeaderValue>,
     session: NativeHttpSession,
     origin_auth: OriginAuth,
+    random_user_agents: Option<RandomUserAgentPool>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -66,6 +70,7 @@ struct NativeHttpEngineConfig {
     client_key: Vec<u8>,
     auth_type: String,
     auth_credential: String,
+    random_user_agents: Vec<String>,
 }
 
 struct CachedNativeHttpEngine {
@@ -93,6 +98,7 @@ impl NativeHttpEngine {
         client_key=Vec::new(),
         auth_type="".to_string(),
         auth_credential="".to_string(),
+        random_user_agents=Vec::new(),
         session=None,
     ))]
     fn new(
@@ -108,6 +114,7 @@ impl NativeHttpEngine {
         client_key: Vec<u8>,
         auth_type: String,
         auth_credential: String,
+        random_user_agents: Vec<String>,
         session: Option<PyRef<'_, NativeHttpSession>>,
     ) -> PyResult<Self> {
         Self::from_config(
@@ -124,6 +131,7 @@ impl NativeHttpEngine {
                 client_key,
                 auth_type,
                 auth_credential,
+                random_user_agents,
             },
             session.as_deref().cloned().unwrap_or_default(),
         )
@@ -219,6 +227,17 @@ impl NativeHttpEngine {
     ) -> PyResult<Self> {
         let method = Method::from_bytes(config.method.as_bytes())
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        if !config.random_user_agents.is_empty()
+            && config
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        {
+            return Err(PyRuntimeError::new_err(RANDOM_USER_AGENT_CONFLICT_ERROR));
+        }
+        let random_user_agents =
+            RandomUserAgentPool::from_values(config.random_user_agents.clone())
+                .map_err(PyRuntimeError::new_err)?;
         let origin_auth = OriginAuth::from_config(&config.auth_type, &config.auth_credential)
             .map_err(PyRuntimeError::new_err)?;
         if !matches!(&origin_auth, OriginAuth::None) {
@@ -301,6 +320,7 @@ impl NativeHttpEngine {
                 initial_cookie_override,
                 session,
                 origin_auth,
+                random_user_agents,
             }),
             cancelled: Arc::new(AtomicBool::new(false)),
         })
@@ -488,6 +508,7 @@ async fn run_scan_worker(task: Arc<ScanTask>) -> WorkerScanResults {
                     method: request_context.method.as_str(),
                     body: request_context.body.as_ref(),
                     headers: &request_context.raw_headers,
+                    random_user_agents: request_context.random_user_agents.as_ref(),
                     timeout_secs: request_context.timeout_secs,
                     max_body_size: task.max_body_size,
                     start,
@@ -512,6 +533,7 @@ async fn run_scan_worker(task: Arc<ScanTask>) -> WorkerScanResults {
                 filter_config: task.filter_config.as_ref(),
                 compact_filtered: task.compact_filtered,
                 origin_auth: &request_context.origin_auth,
+                random_user_agents: request_context.random_user_agents.as_ref(),
             })
             .await
         };
@@ -579,6 +601,7 @@ async fn run_scan_worker(task: Arc<ScanTask>) -> WorkerScanResults {
     client_key=Vec::new(),
     auth_type="".to_string(),
     auth_credential="".to_string(),
+    random_user_agents=Vec::new(),
 ))]
 pub(crate) fn scan_http(
     py: Python<'_>,
@@ -621,6 +644,7 @@ pub(crate) fn scan_http(
     client_key: Vec<u8>,
     auth_type: String,
     auth_credential: String,
+    random_user_agents: Vec<String>,
 ) -> PyResult<Vec<NativeHttpResult>> {
     let config = NativeHttpEngineConfig {
         concurrency,
@@ -635,6 +659,7 @@ pub(crate) fn scan_http(
         client_key,
         auth_type,
         auth_credential,
+        random_user_agents,
     };
     let engine = {
         let cache = DEFAULT_HTTP_ENGINE.get_or_init(|| Mutex::new(None));

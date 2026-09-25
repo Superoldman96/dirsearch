@@ -4,7 +4,7 @@ use crate::filters::NativeFilterConfig;
 use crate::raw_http;
 use crate::result::{native_error_result, native_http_result_with_length, NativeHttpResult};
 use crate::session::NativeCookieStore;
-use crate::transport::HeaderPairs;
+use crate::transport::{HeaderPairs, RandomUserAgentPool};
 use reqwest::cookie::CookieStore;
 #[cfg(test)]
 use std::io::Cursor;
@@ -20,6 +20,7 @@ pub(crate) struct RawHttpRequest<'a> {
     pub(crate) method: &'a str,
     pub(crate) body: &'a [u8],
     pub(crate) headers: &'a HeaderPairs,
+    pub(crate) random_user_agents: Option<&'a RandomUserAgentPool>,
     pub(crate) timeout_secs: f64,
     pub(crate) max_body_size: usize,
     pub(crate) start: Instant,
@@ -125,6 +126,11 @@ async fn raw_http_request_inner(
         request.method
     )
     .into_bytes();
+    if let Some(user_agent) = request.random_user_agents {
+        wire_request.extend_from_slice(b"User-Agent: ");
+        wire_request.extend_from_slice(user_agent.select_raw().as_bytes());
+        wire_request.extend_from_slice(b"\r\n");
+    }
     for (name, value) in request.headers {
         wire_request.extend_from_slice(name.as_bytes());
         wire_request.extend_from_slice(b": ");
