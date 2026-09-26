@@ -71,8 +71,6 @@ def get_native_request_backend_error(opt: Values) -> str | None:
         return error
     if bool(opt.cert_file) != bool(opt.key_file):
         return CLIENT_CERTIFICATE_PAIR_ERROR
-    if opt.random_agents:
-        return "--request-backend native does not support --random-agent yet"
     if opt.network_interface:
         return "--request-backend native does not support --interface yet"
     if opt.ip:
